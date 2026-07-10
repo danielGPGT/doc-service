@@ -6,10 +6,28 @@ Stateless API that converts Canva-exported PPTX templates into personalised PDFs
 
 1. Receives PPTX page files + booking data (JSON)
 2. Preprocesses each PPTX (fixes Canva's text fragmentation)
-3. Replaces `{d.xxx}` placeholder tags with booking data
-4. Converts each page to PDF via LibreOffice
-5. Merges all page PDFs into one final document
-6. Returns the PDF
+3. Expands list-of-link placeholders (see below) into hyperlinked paragraphs
+4. Replaces `{d.xxx}` placeholder tags with booking data
+5. Converts each page to PDF via LibreOffice
+6. Merges all page PDFs into one final document
+7. Returns the PDF
+
+## Hyperlink lists (`{d.ticket_urls_links}`)
+
+Plain `{d.xxx}` substitution is text-only — it cannot create a hyperlink or
+repeat a paragraph, so a single tag can never become several clickable URLs.
+The `{d.ticket_urls_links}` marker is handled specially: it is expanded into one
+label paragraph + one **clickable** URL paragraph per item in
+`booking_data["ticket_urls"]` (a list of `{"label": "...", "url": "..."}`).
+
+The URL is set as an explicit run hyperlink, so it stays clickable even when it
+wraps across lines (LibreOffice's auto-detection only links the first line), and
+the visible URL text remains copy-pasteable. Authoring rules:
+
+- Put the marker on **its own paragraph** in a text box (it replaces that paragraph).
+- Link colour / underline / font size are inherited from the marker paragraph —
+  style that paragraph to control how the links look.
+- An empty/absent list just removes the marker (renders nothing).
 
 ## Endpoints
 
