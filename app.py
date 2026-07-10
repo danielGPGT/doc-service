@@ -15,6 +15,7 @@ Endpoints:
   GET  /health         — Health check
 """
 
+import copy
 import io
 import os
 import re
@@ -27,6 +28,7 @@ from pathlib import Path
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from pptx import Presentation
+from pptx.oxml.ns import qn
 from lxml import etree
 from pypdf import PdfReader, PdfWriter
 
@@ -173,6 +175,97 @@ def preprocess_presentation(prs):
                     legacy.extend(re.findall(r'<<\w+>>', text))
 
     return total_merged, list(set(placeholders)), list(set(legacy))
+
+
+# ─────────────────────────────────────────────────────────────────
+# LIST-OF-LINKS EXPANSION (variable-length hyperlink lists)
+# ─────────────────────────────────────────────────────────────────
+#
+# The base substitutor only swaps text — it can't create a hyperlink or repeat
+# a paragraph, so a single {d.xxx} tag can never become N clickable URLs. This
+# pass handles that case for e-ticket URLs: the {d.ticket_urls_links} marker is
+# expanded into one label paragraph + one hyperlinked URL paragraph per item in
+# booking_data["ticket_urls"] (a list of {"label", "url"} objects). The URL is
+# set as an *explicit* run hyperlink, so it stays clickable even when it wraps
+# across lines (unlike LibreOffice's auto-detection, which only links the first
+# line), and the visible URL text is still copy-pasteable.
+#
+# The marker must sit on its own paragraph. Link formatting (colour/underline/
+# size) is inherited from the marker paragraph, so style that paragraph to taste.
+
+TICKET_LINKS_MARKER = "{d.ticket_urls_links}"
+
+
+def _set_paragraph_text(p_elem, text):
+    """Reduce an <a:p> to a single run carrying `text`, keeping the first run's formatting."""
+    r_elems = p_elem.findall(qn('a:r'))
+    if not r_elems:
+        return
+    for extra in r_elems[1:]:
+        p_elem.remove(extra)
+    t = r_elems[0].find(qn('a:t'))
+    if t is None:
+        t = etree.SubElement(r_elems[0], qn('a:t'))
+    t.text = text
+
+
+def expand_ticket_link_lists(prs, booking_data):
+    """Expand {d.ticket_urls_links} into one hyperlinked paragraph per e-ticket URL."""
+    items = booking_data.get("ticket_urls")
+    if not isinstance(items, list):
+        items = []
+
+    expanded = 0
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            for tf in get_all_text_frames(shape):
+                target = None
+                for para in tf.paragraphs:
+                    if TICKET_LINKS_MARKER in (para.text or ""):
+                        target = para
+                        break
+                if target is None:
+                    continue
+
+                p_elem = target._p
+                parent = p_elem.getparent()
+                idx = list(parent).index(p_elem)
+
+                url_elems = []  # (a:p element, url) — hyperlinked after insertion
+                offset = 0
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    label = str(item.get("label") or "").strip()
+                    url = str(item.get("url") or "").strip()
+                    if label:
+                        lp = copy.deepcopy(p_elem)
+                        _set_paragraph_text(lp, label)
+                        parent.insert(idx + offset, lp)
+                        offset += 1
+                    if url:
+                        up = copy.deepcopy(p_elem)
+                        _set_paragraph_text(up, url)
+                        parent.insert(idx + offset, up)
+                        offset += 1
+                        url_elems.append((up, url))
+
+                if offset > 0:
+                    parent.remove(p_elem)
+                else:
+                    # Empty list — blank the marker so it doesn't render raw.
+                    _set_paragraph_text(p_elem, "")
+
+                # Attach explicit hyperlinks via the python-pptx run API so the
+                # relationship is registered on the slide part.
+                if url_elems:
+                    for para in tf.paragraphs:
+                        for up, url in url_elems:
+                            if para._p is up and para.runs:
+                                para.runs[0].hyperlink.address = url
+                expanded += len(url_elems)
+
+    return expanded
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -348,6 +441,11 @@ def render_single_page(pptx_bytes, booking_data, work_dir):
     prs = Presentation(pptx_path)
     merged, placeholders, legacy = preprocess_presentation(prs)
 
+    # Expand variable-length link lists (e.g. {d.ticket_urls_links}) into one
+    # hyperlinked paragraph per item. Must run before generic substitution so
+    # the marker is gone before the {d.\w+} scan flags it as unmatched.
+    links_expanded = expand_ticket_link_lists(prs, booking_data)
+
     # Substitute
     replaced, unmatched = substitute_placeholders(prs, booking_data)
 
@@ -362,6 +460,7 @@ def render_single_page(pptx_bytes, booking_data, work_dir):
         "merged_runs": merged,
         "placeholders_found": placeholders,
         "placeholders_replaced": replaced,
+        "links_expanded": links_expanded,
         "unmatched": unmatched,
         "legacy_tags": legacy,
         "slide_count": len(prs.slides),
