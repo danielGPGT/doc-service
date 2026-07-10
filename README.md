@@ -24,10 +24,20 @@ The URL is set as an explicit run hyperlink, so it stays clickable even when it
 wraps across lines (LibreOffice's auto-detection only links the first line), and
 the visible URL text remains copy-pasteable. Authoring rules:
 
-- Put the marker on **its own paragraph** in a text box (it replaces that paragraph).
+- Put the marker on **its own paragraph** in a text box or table cell (it replaces that paragraph).
 - Link colour / underline / font size are inherited from the marker paragraph —
   style that paragraph to control how the links look.
 - An empty/absent list just removes the marker (renders nothing).
+
+### Pagination for long lists
+
+A slide is a fixed-size canvas, so a long list would overflow the edge and get
+clipped. When `booking_data["ticket_urls"]` has more than `MAX_TICKET_LINKS_PER_PAGE`
+items (default **8**, override via env var), **only the slide containing the marker**
+is cloned once per chunk and the links are spread across the copies. Every other
+slide in the same PPTX (instructions, sample ticket, track map, …) is left
+untouched and keeps its position. Pre-existing hyperlinks and images on the cloned
+slide are preserved. Tune `MAX_TICKET_LINKS_PER_PAGE` to how many links fit your box.
 
 ## Endpoints
 
