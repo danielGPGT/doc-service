@@ -178,7 +178,7 @@ def preprocess_presentation(prs):
 
 
 # ─────────────────────────────────────────────────────────────────
-# LIST-OF-LINKS EXPANSION (variable-length hyperlink lists)
+# LIST-OF-LINKS EXPANSION (variable-length hyperlink lists + pagination)
 # ─────────────────────────────────────────────────────────────────
 #
 # The base substitutor only swaps text — it can't create a hyperlink or repeat
@@ -190,10 +190,19 @@ def preprocess_presentation(prs):
 # across lines (unlike LibreOffice's auto-detection, which only links the first
 # line), and the visible URL text is still copy-pasteable.
 #
+# PAGINATION: a slide is a fixed-size canvas — too many links overflow the edge
+# and get clipped. So when the list is longer than MAX_TICKET_LINKS_PER_PAGE, the
+# *marker slide only* is cloned once per chunk and the links are spread across the
+# copies. Other slides in the same PPTX (instructions, sample ticket, track map…)
+# are left untouched, and their order is preserved.
+#
 # The marker must sit on its own paragraph. Link formatting (colour/underline/
 # size) is inherited from the marker paragraph, so style that paragraph to taste.
 
 TICKET_LINKS_MARKER = "{d.ticket_urls_links}"
+MAX_TICKET_LINKS_PER_PAGE = int(os.environ.get("MAX_TICKET_LINKS_PER_PAGE", 8))
+
+_R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 
 
 def _set_paragraph_text(p_elem, text):
@@ -209,61 +218,117 @@ def _set_paragraph_text(p_elem, text):
     t.text = text
 
 
+def _find_ticket_marker(slide):
+    """Return (text_frame, paragraph) of the first {d.ticket_urls_links} marker, else (None, None)."""
+    for shape in slide.shapes:
+        for tf in get_all_text_frames(shape):
+            for para in tf.paragraphs:
+                if TICKET_LINKS_MARKER in (para.text or ""):
+                    return tf, para
+    return None, None
+
+
+def _copy_rels_for_element(src_part, dest_part, element):
+    """Recreate on dest_part any relationships (images, hyperlinks) referenced inside element."""
+    for el in element.iter():
+        for attr in (f"{{{_R_NS}}}embed", f"{{{_R_NS}}}id", f"{{{_R_NS}}}link"):
+            rid = el.get(attr)
+            if not rid or rid not in src_part.rels:
+                continue
+            rel = src_part.rels[rid]
+            if rel.is_external:
+                new_rid = dest_part.relate_to(rel.target_ref, rel.reltype, is_external=True)
+            else:
+                new_rid = dest_part.relate_to(rel.target_part, rel.reltype)
+            el.set(attr, new_rid)
+
+
+def _duplicate_slide_after(prs, src_index):
+    """Clone the slide at src_index (shapes + referenced rels) and place the copy right after it."""
+    src = prs.slides[src_index]
+    dest = prs.slides.add_slide(src.slide_layout)  # appended at the end for now
+    # Drop the placeholder shapes add_slide copied from the layout.
+    for shp in list(dest.shapes):
+        shp._element.getparent().remove(shp._element)
+    # Copy the source shape tree (skip the group-level props dest already owns).
+    dest_spTree = dest.shapes._spTree
+    for child in list(src.shapes._spTree):
+        if child.tag in (qn('p:nvGrpSpPr'), qn('p:grpSpPr')):
+            continue
+        new_child = copy.deepcopy(child)
+        _copy_rels_for_element(src.part, dest.part, new_child)
+        dest_spTree.append(new_child)
+    # Move the new slide (currently last) to sit immediately after the source.
+    sld_id_lst = prs.slides._sldIdLst
+    moved = list(sld_id_lst)[-1]
+    sld_id_lst.remove(moved)
+    sld_id_lst.insert(src_index + 1, moved)
+    return dest
+
+
+def _expand_marker(tf, para, items):
+    """Replace the marker paragraph with one label + one hyperlinked URL paragraph per item."""
+    p_elem = para._p
+    parent = p_elem.getparent()
+    idx = list(parent).index(p_elem)
+
+    url_elems = []  # (a:p element, url) — hyperlinked after insertion
+    offset = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or "").strip()
+        url = str(item.get("url") or "").strip()
+        if label:
+            lp = copy.deepcopy(p_elem)
+            _set_paragraph_text(lp, label)
+            parent.insert(idx + offset, lp)
+            offset += 1
+        if url:
+            up = copy.deepcopy(p_elem)
+            _set_paragraph_text(up, url)
+            parent.insert(idx + offset, up)
+            offset += 1
+            url_elems.append((up, url))
+
+    if offset > 0:
+        parent.remove(p_elem)
+    else:
+        # Empty chunk — blank the marker so it doesn't render raw.
+        _set_paragraph_text(p_elem, "")
+
+    # Attach explicit hyperlinks via the python-pptx run API so the relationship
+    # is registered on the (correct) slide part.
+    for p in tf.paragraphs:
+        for up, url in url_elems:
+            if p._p is up and p.runs:
+                p.runs[0].hyperlink.address = url
+    return len(url_elems)
+
+
 def expand_ticket_link_lists(prs, booking_data):
-    """Expand {d.ticket_urls_links} into one hyperlinked paragraph per e-ticket URL."""
+    """Expand + paginate {d.ticket_urls_links} across cloned copies of the marker slide."""
     items = booking_data.get("ticket_urls")
     if not isinstance(items, list):
         items = []
+    per = MAX_TICKET_LINKS_PER_PAGE if MAX_TICKET_LINKS_PER_PAGE > 0 else max(len(items), 1)
+
+    # Snapshot marker-slide indexes before cloning shifts anything.
+    marker_indexes = [i for i in range(len(prs.slides))
+                      if _find_ticket_marker(prs.slides[i])[0] is not None]
 
     expanded = 0
-    for slide in prs.slides:
-        for shape in slide.shapes:
-            for tf in get_all_text_frames(shape):
-                target = None
-                for para in tf.paragraphs:
-                    if TICKET_LINKS_MARKER in (para.text or ""):
-                        target = para
-                        break
-                if target is None:
-                    continue
-
-                p_elem = target._p
-                parent = p_elem.getparent()
-                idx = list(parent).index(p_elem)
-
-                url_elems = []  # (a:p element, url) — hyperlinked after insertion
-                offset = 0
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    label = str(item.get("label") or "").strip()
-                    url = str(item.get("url") or "").strip()
-                    if label:
-                        lp = copy.deepcopy(p_elem)
-                        _set_paragraph_text(lp, label)
-                        parent.insert(idx + offset, lp)
-                        offset += 1
-                    if url:
-                        up = copy.deepcopy(p_elem)
-                        _set_paragraph_text(up, url)
-                        parent.insert(idx + offset, up)
-                        offset += 1
-                        url_elems.append((up, url))
-
-                if offset > 0:
-                    parent.remove(p_elem)
-                else:
-                    # Empty list — blank the marker so it doesn't render raw.
-                    _set_paragraph_text(p_elem, "")
-
-                # Attach explicit hyperlinks via the python-pptx run API so the
-                # relationship is registered on the slide part.
-                if url_elems:
-                    for para in tf.paragraphs:
-                        for up, url in url_elems:
-                            if para._p is up and para.runs:
-                                para.runs[0].hyperlink.address = url
-                expanded += len(url_elems)
+    # Right-to-left so clones inserted after a slide don't shift indexes we still owe.
+    for si in reversed(marker_indexes):
+        chunks = [items[j:j + per] for j in range(0, len(items), per)] or [[]]
+        # Clone the marker slide once per extra chunk, kept contiguous after it.
+        for extra in range(1, len(chunks)):
+            _duplicate_slide_after(prs, si + extra - 1)
+        # Fill each page (original + clones) with its chunk.
+        for ci, chunk in enumerate(chunks):
+            tf, para = _find_ticket_marker(prs.slides[si + ci])
+            if para is not None:
+                expanded += _expand_marker(tf, para, chunk)
 
     return expanded
 
